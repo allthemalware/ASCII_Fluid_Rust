@@ -89,6 +89,34 @@ impl Sim {
         PyBytes::new(py, &buf)
     }
 
+    /// Inject a named distortion (the mobile brush set): vortex, burst, implode,
+    /// jet, dipole, shock(wave), turbulence, (ink )bloom, or shear. `spin` picks
+    /// the vortex direction (±1), `scale` sizes the splat relative to a tap.
+    fn apply_brush(&mut self, kind: &str, x: f32, y: f32, spin: f32, scale: f32) -> PyResult<()> {
+        let brush = fluid::Brush::from_name(kind).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!("unknown brush: {kind}"))
+        })?;
+        let rng = &mut self.rng;
+        self.f.apply_brush(brush, x, y, spin, scale, &mut || rng.f());
+        Ok(())
+    }
+
+    /// Uniform body force (wind / gravity) folded into the next `step` — call
+    /// each tick while the force should act.
+    fn add_uniform(&mut self, ax: f32, ay: f32) {
+        self.f.add_uniform(ax, ay);
+    }
+
+    /// Zero everything (velocity, dye, pending sources).
+    fn clear(&mut self) {
+        self.f.clear_all();
+    }
+
+    /// Zero the dye only — the flow keeps moving.
+    fn clear_dye(&mut self) {
+        self.f.clear_dye();
+    }
+
     /// Inject dye + a vortex at a point (cell coords) — for effects that react to the
     /// game: a spell's impact, something catching fire, corruption spreading.
     fn add_source(&mut self, x: f32, y: f32, r: f32, amount: f32) {

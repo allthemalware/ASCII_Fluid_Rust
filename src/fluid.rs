@@ -5,6 +5,69 @@
 //! Grids are stored as flat `Vec<f32>` of size `(nx+2)*(ny+2)` — a one-cell
 //! border around the `nx*ny` interior carries the boundary conditions.
 
+/// The distortion type injected by clicks / seeding / autopilot — same set as
+/// the mobile version's brush picker.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Brush {
+    Vortex,
+    Burst,
+    Implode,
+    Jet,
+    Dipole,
+    Shock,
+    Turbulence,
+    Bloom,
+    Shear,
+}
+
+pub const BRUSHES: [Brush; 9] = [
+    Brush::Vortex,
+    Brush::Burst,
+    Brush::Implode,
+    Brush::Jet,
+    Brush::Dipole,
+    Brush::Shock,
+    Brush::Turbulence,
+    Brush::Bloom,
+    Brush::Shear,
+];
+
+impl Brush {
+    /// Display name (HUD).
+    pub fn name(self) -> &'static str {
+        match self {
+            Brush::Vortex => "vortex",
+            Brush::Burst => "burst",
+            Brush::Implode => "implode",
+            Brush::Jet => "jet",
+            Brush::Dipole => "dipole",
+            Brush::Shock => "shockwave",
+            Brush::Turbulence => "turbulence",
+            Brush::Bloom => "ink bloom",
+            Brush::Shear => "shear",
+        }
+    }
+
+    /// Stable short key (config file, Python API) — the mobile object keys.
+    pub fn key(self) -> &'static str {
+        match self {
+            Brush::Vortex => "vortex",
+            Brush::Burst => "burst",
+            Brush::Implode => "implode",
+            Brush::Jet => "jet",
+            Brush::Dipole => "dipole",
+            Brush::Shock => "shock",
+            Brush::Turbulence => "turbulence",
+            Brush::Bloom => "bloom",
+            Brush::Shear => "shear",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<Brush> {
+        BRUSHES.iter().copied().find(|b| b.key() == s || b.name() == s)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Dims {
     nx: usize,
@@ -115,15 +178,19 @@ impl Fluid {
     }
 
     // ---- public field accessors used by the renderer ----
+    // (speed/vorticity are only called from the window binary, so the lib
+    // target sees them as dead code)
     #[inline]
     pub fn dye(&self, i: usize, j: usize) -> f32 {
         self.d[self.ix(i, j)]
     }
+    #[allow(dead_code)]
     #[inline]
     pub fn speed(&self, i: usize, j: usize) -> f32 {
         let k = self.ix(i, j);
         self.u[k].abs() + self.v[k].abs()
     }
+    #[allow(dead_code)]
     #[inline]
     pub fn vorticity(&self, i: usize, j: usize) -> f32 {
         self.curl[self.ix(i, j)]
@@ -192,6 +259,190 @@ impl Fluid {
         }
     }
 
+    /// Radial push away from the centre (negative strength = implode) + dye.
+    pub fn splat_burst(&mut self, cx: f32, cy: f32, strength: f32, radius: f32, dye: f32) {
+        let r2 = radius * radius;
+        let rad = (radius * 3.0).ceil() as i32;
+        let ci = cx.round() as i32;
+        let cj = cy.round() as i32;
+        for dj in -rad..=rad {
+            for di in -rad..=rad {
+                let i = ci + di;
+                let j = cj + dj;
+                if i < 1 || i > self.nx as i32 || j < 1 || j > self.ny as i32 {
+                    continue;
+                }
+                let d2 = (di * di + dj * dj) as f32;
+                let r = d2.sqrt().max(1.0);
+                let fall = (-d2 / (2.0 * r2)).exp();
+                let k = self.ix(i as usize, j as usize);
+                self.u[k] += (di as f32 / r) * strength * fall;
+                self.v[k] += (dj as f32 / r) * strength * fall;
+                self.d[k] += dye * fall;
+            }
+        }
+    }
+
+    /// Directional push along (dx, dy) + dye.
+    pub fn splat_jet(&mut self, cx: f32, cy: f32, dx: f32, dy: f32, strength: f32, radius: f32, dye: f32) {
+        let (dx, dy) = norm_dir(dx, dy);
+        let r2 = radius * radius;
+        let rad = (radius * 3.0).ceil() as i32;
+        let ci = cx.round() as i32;
+        let cj = cy.round() as i32;
+        for dj in -rad..=rad {
+            for di in -rad..=rad {
+                let i = ci + di;
+                let j = cj + dj;
+                if i < 1 || i > self.nx as i32 || j < 1 || j > self.ny as i32 {
+                    continue;
+                }
+                let fall = (-((di * di + dj * dj) as f32) / (2.0 * r2)).exp();
+                let k = self.ix(i as usize, j as usize);
+                self.u[k] += dx * strength * fall;
+                self.v[k] += dy * strength * fall;
+                self.d[k] += dye * fall;
+            }
+        }
+    }
+
+    /// Two counter-rotating cores propel a ring along (dx, dy).
+    pub fn splat_dipole(&mut self, cx: f32, cy: f32, dx: f32, dy: f32, strength: f32, radius: f32, dye: f32) {
+        let (dx, dy) = norm_dir(dx, dy);
+        let (px, py) = (-dy, dx);
+        let off = radius * 0.6;
+        self.splat_vortex(cx + px * off, cy + py * off, strength, radius * 0.8, dye * 0.55);
+        self.splat_vortex(cx - px * off, cy - py * off, -strength, radius * 0.8, dye * 0.55);
+        self.splat_jet(cx, cy, dx, dy, strength * 0.6, radius * 0.7, dye * 0.4);
+    }
+
+    /// Expanding ring: radial push concentrated in a Gaussian shell.
+    pub fn splat_shock(&mut self, cx: f32, cy: f32, strength: f32, radius: f32, dye: f32) {
+        let rad = (radius * 2.0).ceil() as i32;
+        let shell = radius * 0.5;
+        let ring = radius * 0.6;
+        let ci = cx.round() as i32;
+        let cj = cy.round() as i32;
+        for dj in -rad..=rad {
+            for di in -rad..=rad {
+                let i = ci + di;
+                let j = cj + dj;
+                if i < 1 || i > self.nx as i32 || j < 1 || j > self.ny as i32 {
+                    continue;
+                }
+                let r = ((di * di + dj * dj) as f32).sqrt().max(1.0);
+                let fall = (-((r - ring) * (r - ring)) / (2.0 * shell * shell)).exp();
+                let k = self.ix(i as usize, j as usize);
+                self.u[k] += (di as f32 / r) * strength * fall;
+                self.v[k] += (dj as f32 / r) * strength * fall;
+                self.d[k] += dye * fall * 0.8;
+            }
+        }
+    }
+
+    /// A handful of small random vortices — chaotic churn. `rng` yields 0..1.
+    pub fn splat_turb(&mut self, cx: f32, cy: f32, strength: f32, radius: f32, dye: f32, rng: &mut impl FnMut() -> f32) {
+        for _ in 0..6 {
+            let a = rng() * std::f32::consts::TAU;
+            let rr = rng() * radius;
+            let x = cx + a.cos() * rr;
+            let y = cy + a.sin() * rr;
+            let sign = if rng() < 0.5 { -1.0 } else { 1.0 };
+            self.splat_vortex(x, y, sign * strength * (0.5 + rng()), radius * 0.35, dye * 0.5);
+        }
+    }
+
+    /// Pure dye blob — no velocity.
+    pub fn splat_bloom(&mut self, cx: f32, cy: f32, radius: f32, dye: f32) {
+        let r2 = radius * radius;
+        let rad = (radius * 3.0).ceil() as i32;
+        let ci = cx.round() as i32;
+        let cj = cy.round() as i32;
+        for dj in -rad..=rad {
+            for di in -rad..=rad {
+                let i = ci + di;
+                let j = cj + dj;
+                if i < 1 || i > self.nx as i32 || j < 1 || j > self.ny as i32 {
+                    continue;
+                }
+                let fall = (-((di * di + dj * dj) as f32) / (2.0 * r2)).exp();
+                let k = self.ix(i as usize, j as usize);
+                self.d[k] += dye * fall;
+            }
+        }
+    }
+
+    /// Opposite drift on either side of the axis -> the sheet rolls up.
+    pub fn splat_shear(&mut self, cx: f32, cy: f32, dx: f32, dy: f32, strength: f32, radius: f32, dye: f32) {
+        let (dx, dy) = norm_dir(dx, dy);
+        let (px, py) = (-dy, dx);
+        let r2 = radius * radius;
+        let rad = (radius * 3.0).ceil() as i32;
+        let ci = cx.round() as i32;
+        let cj = cy.round() as i32;
+        for dj in -rad..=rad {
+            for di in -rad..=rad {
+                let i = ci + di;
+                let j = cj + dj;
+                if i < 1 || i > self.nx as i32 || j < 1 || j > self.ny as i32 {
+                    continue;
+                }
+                let fall = (-((di * di + dj * dj) as f32) / (2.0 * r2)).exp();
+                let s = if di as f32 * px + dj as f32 * py >= 0.0 { 1.0 } else { -1.0 };
+                let k = self.ix(i as usize, j as usize);
+                self.u[k] += dx * strength * s * fall;
+                self.v[k] += dy * strength * s * fall;
+                self.d[k] += dye * fall;
+            }
+        }
+    }
+
+    /// Mobile-parity brush dispatch: turn a point + selected brush into the
+    /// matching distortion. `spin` picks the vortex direction, `scale` shrinks
+    /// autopilot swirls, and `rng` (0..1) supplies the random jet/dipole/shear
+    /// heading plus turbulence jitter.
+    pub fn apply_brush(&mut self, brush: Brush, cx: f32, cy: f32, spin: f32, scale: f32, rng: &mut impl FnMut() -> f32) {
+        let rad = (self.nx.min(self.ny) as f32 * 0.07).clamp(3.0, 11.0) * scale;
+        let s = 1.15 * scale;
+        let dye = 1.2;
+        let dir = |r: &mut dyn FnMut() -> f32| {
+            let a = r() * std::f32::consts::TAU;
+            (a.cos(), a.sin())
+        };
+        match brush {
+            Brush::Vortex => self.splat_vortex(cx, cy, spin * s, rad, dye),
+            Brush::Burst => self.splat_burst(cx, cy, s * 0.9, rad, dye),
+            Brush::Implode => self.splat_burst(cx, cy, -s * 0.9, rad, dye * 0.6),
+            Brush::Jet => {
+                let (dx, dy) = dir(rng);
+                self.splat_jet(cx, cy, dx, dy, s * 1.4, rad, dye);
+            }
+            Brush::Dipole => {
+                let (dx, dy) = dir(rng);
+                self.splat_dipole(cx, cy, dx, dy, s * 1.2, rad, dye);
+            }
+            Brush::Shock => self.splat_shock(cx, cy, s * 1.3, rad * 1.4, dye),
+            Brush::Turbulence => self.splat_turb(cx, cy, s, rad * 1.3, dye * 0.8, rng),
+            Brush::Bloom => self.splat_bloom(cx, cy, rad * 1.15, dye * 1.3),
+            Brush::Shear => {
+                let (dx, dy) = dir(rng);
+                self.splat_shear(cx, cy, dx, dy, s * 1.1, rad * 1.2, dye);
+            }
+        }
+    }
+
+    /// Uniform body force over the interior (gravity / wind) — folded into the
+    /// velocity sources for the next step.
+    pub fn add_uniform(&mut self, ax: f32, ay: f32) {
+        for j in 1..=self.ny {
+            let b = j * self.w;
+            for i in 1..=self.nx {
+                self.u_src[b + i] += ax;
+                self.v_src[b + i] += ay;
+            }
+        }
+    }
+
     /// Add a directional force + dye over a small brush (used while dragging).
     pub fn add_force(&mut self, i: usize, j: usize, fx: f32, fy: f32, dye: f32, brush: i32) {
         let denom = 2.0 * (brush * brush) as f32 + 0.1;
@@ -210,6 +461,13 @@ impl Fluid {
             }
         }
     }
+}
+
+/// Normalize a direction; a zero vector stays zero (mobile `hypot(..)||1`).
+fn norm_dir(dx: f32, dy: f32) -> (f32, f32) {
+    let l = (dx * dx + dy * dy).sqrt();
+    let l = if l > 0.0 { l } else { 1.0 };
+    (dx / l, dy / l)
 }
 
 // ======================================================================
@@ -380,5 +638,31 @@ mod tests {
             assert!(max_u < 50.0, "velocity blew up: {max_u}");
             assert!(max_curl > 0.0, "curl field not populated (eps={eps})");
         }
+    }
+
+    #[test]
+    fn brushes_and_gravity_stay_finite() {
+        let mut seed = 0xC0FF_EE11u32;
+        let mut rng = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed >> 8) as f32 / (1u32 << 24) as f32
+        };
+        let mut f = Fluid::new(90, 50);
+        for (n, &b) in BRUSHES.iter().enumerate() {
+            let x = 8.0 + n as f32 * 9.0;
+            let spin = if n % 2 == 0 { 1.0 } else { -1.0 };
+            f.apply_brush(b, x, 25.0, spin, 1.0, &mut rng);
+        }
+        for _ in 0..300 {
+            f.add_uniform(0.0, 2.0); // gravity at the default slider setting
+            f.step(0.12);
+        }
+        let max_u = f.u.iter().cloned().fold(0.0f32, |m, x| m.max(x.abs()));
+        assert!(f.u.iter().all(|x| x.is_finite()), "velocity went non-finite");
+        assert!(f.v.iter().all(|x| x.is_finite()), "velocity went non-finite");
+        assert!(f.d.iter().all(|x| x.is_finite()), "dye went non-finite");
+        assert!(max_u < 50.0, "velocity blew up: {max_u}");
     }
 }

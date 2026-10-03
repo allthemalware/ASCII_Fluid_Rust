@@ -70,13 +70,30 @@ fn main() {
             .update_with_buffer(&buf, w, h)
             .expect("failed to update window");
     }
+
+    app.save_config();
 }
 
+/// Dump glyph coverage for every ramp (flagging blanks), then draw a sample of
+/// glyphs as ASCII art — confirms bit orientation and charset coverage without
+/// opening a window.
 fn font_test() {
-    use font8x8::legacy::BASIC_LEGACY;
-    for ch in ['A', 'F', 'R', '#'] {
+    for ramp in palette::RAMPS {
+        let missing: Vec<char> = ramp
+            .chars
+            .chars()
+            .skip(1) // the blank slot
+            .filter(|&c| !matches!(render::glyph(c), Some(g) if g.iter().any(|&r| r != 0)))
+            .collect();
+        if missing.is_empty() {
+            println!("{:12} ok ({} glyphs)", ramp.name, ramp.chars.chars().count());
+        } else {
+            println!("{:12} MISSING {missing:?}", ramp.name);
+        }
+    }
+    for ch in ['A', '#', '\u{2022}', '\u{25cf}', '\u{2191}', '\u{2192}', '\u{21d2}', '\u{27a4}', '\u{2726}', '\u{2605}', '\u{274b}', '\u{281f}', '\u{2591}', '\u{2500}', '\u{3042}'] {
         println!("glyph '{ch}':");
-        let g = BASIC_LEGACY[ch as usize];
+        let g = render::glyph(ch).unwrap_or([0; 8]);
         for row in g {
             let mut line = String::new();
             for bit in 0..8 {
